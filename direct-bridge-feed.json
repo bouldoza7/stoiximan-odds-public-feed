@@ -1,0 +1,9 @@
+{
+  "status": "initializing",
+  "schema_version": "1.0",
+  "source": "stoiximan_direct_browser",
+  "generated_at": null,
+  "snapshot_count": 0,
+  "fresh_snapshot_count": 0,
+  "snapshots": []
+}
