@@ -1,0 +1,258 @@
+name: Update Direct Bridge Public Feed
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-direct-bridge-public-feed
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Fetch Direct Bridge feed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          direct_url="https://stoiximan-feed-relay.galanisnick.workers.dev/direct-bridge-feed"
+          combined_url="https://stoiximan-feed-relay.galanisnick.workers.dev/combined-feed"
+
+          curl_args=(
+            --fail
+            --silent
+            --show-error
+            --location
+            --connect-timeout 15
+            --max-time 60
+            --retry 2
+            --retry-delay 3
+            --retry-all-errors
+          )
+
+          if curl "${curl_args[@]}" "$direct_url" -o /tmp/upstream.json; then
+            echo "Dedicated Direct Bridge feed retrieved."
+          elif curl "${curl_args[@]}" "$combined_url" -o /tmp/combined.json; then
+            echo "Dedicated endpoint failed; extracting from combined feed."
+
+            python - <<'PY'
+          import json
+          from pathlib import Path
+
+          combined = json.loads(
+              Path("/tmp/combined.json").read_text(encoding="utf-8")
+          )
+
+          direct = (combined.get("direct_bridge_feed") or {}).get("data")
+
+          if not isinstance(direct, dict):
+              raise SystemExit(
+                  "combined-feed does not contain direct_bridge_feed.data"
+              )
+
+          Path("/tmp/upstream.json").write_text(
+              json.dumps(direct, ensure_ascii=False),
+              encoding="utf-8",
+          )
+          PY
+          else
+            echo "::error::Both Cloudflare feed routes failed."
+            exit 1
+          fi
+
+      - name: Validate and prepare public feed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          source_path = Path("/tmp/upstream.json")
+          data = json.loads(source_path.read_text(encoding="utf-8"))
+
+          if data.get("status") != "ok":
+              raise SystemExit(
+                  f"Upstream status is not ok: {data.get('status')!r}"
+              )
+
+          snapshots = data.get("snapshots")
+
+          if not isinstance(snapshots, list) or not snapshots:
+              raise SystemExit(
+                  "Upstream feed has no snapshots; preserving previous public feed."
+              )
+
+          # Keep only the newest snapshot for each Stoiximan event.
+          latest_by_event = {}
+
+          for snapshot in snapshots:
+              if not isinstance(snapshot, dict):
+                  continue
+
+              event_id = str(snapshot.get("stoiximan_event_id") or "").strip()
+
+              if not event_id:
+                  continue
+
+              timestamp = str(
+                  snapshot.get("captured_at")
+                  or snapshot.get("received_at")
+                  or ""
+              )
+
+              previous = latest_by_event.get(event_id)
+
+              if previous is None:
+                  latest_by_event[event_id] = snapshot
+                  continue
+
+              previous_timestamp = str(
+                  previous.get("captured_at")
+                  or previous.get("received_at")
+                  or ""
+              )
+
+              if timestamp > previous_timestamp:
+                  latest_by_event[event_id] = snapshot
+
+          selected = sorted(
+              latest_by_event.values(),
+              key=lambda item: str(
+                  item.get("captured_at")
+                  or item.get("received_at")
+                  or ""
+              ),
+              reverse=True,
+          )[:20]
+
+          if not selected:
+              raise SystemExit("No valid event snapshots found.")
+
+          now = datetime.now(timezone.utc)
+          max_age_minutes = float(
+              data.get("bridge_max_age_minutes") or 5
+          )
+          fresh_count = 0
+          prepared_snapshots = []
+
+          def parse_timestamp(value):
+              if not value:
+                  return None
+
+              try:
+                  parsed = datetime.fromisoformat(
+                      str(value).replace("Z", "+00:00")
+                  )
+
+                  if parsed.tzinfo is None:
+                      parsed = parsed.replace(tzinfo=timezone.utc)
+
+                  return parsed.astimezone(timezone.utc)
+              except (TypeError, ValueError):
+                  return None
+
+          for original in selected:
+              snapshot = dict(original)
+
+              captured = parse_timestamp(
+                  snapshot.get("captured_at")
+                  or snapshot.get("received_at")
+              )
+
+              if captured is None:
+                  age_seconds = None
+                  is_fresh = False
+              else:
+                  age_seconds = max(
+                      0.0,
+                      (now - captured).total_seconds(),
+                  )
+                  is_fresh = age_seconds <= max_age_minutes * 60
+
+              snapshot["age_seconds"] = (
+                  round(age_seconds, 1)
+                  if age_seconds is not None
+                  else None
+              )
+              snapshot["fresh"] = is_fresh
+
+              if is_fresh:
+                  fresh_count += 1
+
+              prepared_snapshots.append(snapshot)
+
+          output = {
+              "status": "ok",
+              "schema_version": "1.0",
+              "version": data.get("version"),
+              "generated_at": now.isoformat().replace("+00:00", "Z"),
+              "upstream_generated_at": data.get("generated_at"),
+              "source": data.get(
+                  "source",
+                  "stoiximan_direct_browser",
+              ),
+              "transport_hint": "github_public_raw_mirror",
+              "upstream_transport_hint": data.get("transport_hint"),
+              "bridge_max_age_minutes": max_age_minutes,
+              "snapshot_count": len(prepared_snapshots),
+              "fresh_snapshot_count": fresh_count,
+              "snapshots": prepared_snapshots,
+          }
+
+          Path("/tmp/direct-bridge-feed.json").write_text(
+              json.dumps(
+                  output,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              ),
+              encoding="utf-8",
+          )
+
+          print(
+              f"Prepared {len(prepared_snapshots)} snapshots; "
+              f"{fresh_count} fresh at publication."
+          )
+          PY
+
+      - name: Publish latest feed to dedicated branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout --orphan public-feed-publication
+          git rm -rf . >/dev/null 2>&1 || true
+
+          cp /tmp/direct-bridge-feed.json ./direct-bridge-feed.json
+
+          cat > README.md <<'EOF'
+          # Stoiximan Direct Bridge Public Feed
+
+          Sanitized automated odds feed.
+
+          No credentials, cookies, tokens or personal data are stored here.
+          EOF
+
+          git add README.md direct-bridge-feed.json
+          git commit -m "Update public Direct Bridge feed"
+
+          git push --force origin HEAD:feed
