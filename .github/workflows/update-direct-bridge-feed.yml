@@ -73,7 +73,7 @@ jobs:
             exit 1
           fi
 
-      - name: Validate and prepare public feed
+      - name: Validate and prepare public files
         shell: bash
         run: |
           set -euo pipefail
@@ -84,6 +84,12 @@ jobs:
           from pathlib import Path
 
           source_path = Path("/tmp/upstream.json")
+          publication_dir = Path("/tmp/publication")
+          events_dir = publication_dir / "events"
+
+          publication_dir.mkdir(parents=True, exist_ok=True)
+          events_dir.mkdir(parents=True, exist_ok=True)
+
           data = json.loads(source_path.read_text(encoding="utf-8"))
 
           if data.get("status") != "ok":
@@ -98,14 +104,15 @@ jobs:
                   "Upstream feed has no snapshots; preserving previous public feed."
               )
 
-          # Keep only the newest snapshot for each Stoiximan event.
           latest_by_event = {}
 
           for snapshot in snapshots:
               if not isinstance(snapshot, dict):
                   continue
 
-              event_id = str(snapshot.get("stoiximan_event_id") or "").strip()
+              event_id = str(
+                  snapshot.get("stoiximan_event_id") or ""
+              ).strip()
 
               if not event_id:
                   continue
@@ -145,11 +152,10 @@ jobs:
               raise SystemExit("No valid event snapshots found.")
 
           now = datetime.now(timezone.utc)
+          generated_at = now.isoformat().replace("+00:00", "Z")
           max_age_minutes = float(
               data.get("bridge_max_age_minutes") or 5
           )
-          fresh_count = 0
-          prepared_snapshots = []
 
           def parse_timestamp(value):
               if not value:
@@ -167,8 +173,16 @@ jobs:
               except (TypeError, ValueError):
                   return None
 
+          prepared_snapshots = []
+          index_events = []
+          fresh_count = 0
+
           for original in selected:
               snapshot = dict(original)
+
+              event_id = str(
+                  snapshot.get("stoiximan_event_id") or ""
+              ).strip()
 
               captured = parse_timestamp(
                   snapshot.get("captured_at")
@@ -183,7 +197,9 @@ jobs:
                       0.0,
                       (now - captured).total_seconds(),
                   )
-                  is_fresh = age_seconds <= max_age_minutes * 60
+                  is_fresh = (
+                      age_seconds <= max_age_minutes * 60
+                  )
 
               snapshot["age_seconds"] = (
                   round(age_seconds, 1)
@@ -197,35 +213,118 @@ jobs:
 
               prepared_snapshots.append(snapshot)
 
-          output = {
+              event_payload = {
+                  "status": "ok",
+                  "schema_version": "1.1",
+                  "version": data.get("version"),
+                  "generated_at": generated_at,
+                  "upstream_generated_at": data.get("generated_at"),
+                  "source": data.get(
+                      "source",
+                      "stoiximan_direct_browser",
+                  ),
+                  "transport_hint": "github_public_raw_mirror",
+                  "bridge_max_age_minutes": max_age_minutes,
+                  "snapshot": snapshot,
+              }
+
+              event_file = events_dir / f"{event_id}.json"
+
+              event_file.write_text(
+                  json.dumps(
+                      event_payload,
+                      ensure_ascii=False,
+                      indent=2,
+                  )
+                  + "\n",
+                  encoding="utf-8",
+              )
+
+              index_events.append(
+                  {
+                      "stoiximan_event_id": event_id,
+                      "betradar_id": snapshot.get("betradar_id"),
+                      "sport_id": snapshot.get("sport_id"),
+                      "event_name": snapshot.get("event_name"),
+                      "start_time": snapshot.get("start_time"),
+                      "snapshot_id": snapshot.get("snapshot_id"),
+                      "captured_at": snapshot.get("captured_at"),
+                      "received_at": snapshot.get("received_at"),
+                      "bridge_version": snapshot.get("bridge_version"),
+                      "total_markets_available": snapshot.get(
+                          "total_markets_available"
+                      ),
+                      "market_objects_received": snapshot.get(
+                          "market_objects_received"
+                      ),
+                      "rows_count": snapshot.get("rows_count"),
+                      "age_seconds": snapshot.get("age_seconds"),
+                      "fresh": snapshot.get("fresh"),
+                      "file": f"events/{event_id}.json",
+                  }
+              )
+
+          feed_index = {
               "status": "ok",
-              "schema_version": "1.0",
+              "schema_version": "1.1",
               "version": data.get("version"),
-              "generated_at": now.isoformat().replace("+00:00", "Z"),
+              "generated_at": generated_at,
               "upstream_generated_at": data.get("generated_at"),
               "source": data.get(
                   "source",
                   "stoiximan_direct_browser",
               ),
               "transport_hint": "github_public_raw_mirror",
-              "upstream_transport_hint": data.get("transport_hint"),
+              "bridge_max_age_minutes": max_age_minutes,
+              "snapshot_count": len(prepared_snapshots),
+              "fresh_snapshot_count": fresh_count,
+              "events": index_events,
+          }
+
+          full_feed = {
+              "status": "ok",
+              "schema_version": "1.1",
+              "version": data.get("version"),
+              "generated_at": generated_at,
+              "upstream_generated_at": data.get("generated_at"),
+              "source": data.get(
+                  "source",
+                  "stoiximan_direct_browser",
+              ),
+              "transport_hint": "github_public_raw_mirror",
+              "upstream_transport_hint": data.get(
+                  "transport_hint"
+              ),
               "bridge_max_age_minutes": max_age_minutes,
               "snapshot_count": len(prepared_snapshots),
               "fresh_snapshot_count": fresh_count,
               "snapshots": prepared_snapshots,
           }
 
-          Path("/tmp/direct-bridge-feed.json").write_text(
+          (publication_dir / "feed-index.json").write_text(
               json.dumps(
-                  output,
+                  feed_index,
                   ensure_ascii=False,
-                  separators=(",", ":"),
-              ),
+                  indent=2,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+
+          (
+              publication_dir / "direct-bridge-feed.json"
+          ).write_text(
+              json.dumps(
+                  full_feed,
+                  ensure_ascii=False,
+                  indent=2,
+              )
+              + "\n",
               encoding="utf-8",
           )
 
           print(
-              f"Prepared {len(prepared_snapshots)} snapshots; "
+              f"Prepared {len(prepared_snapshots)} event files; "
               f"{fresh_count} fresh at publication."
           )
           PY
@@ -242,17 +341,23 @@ jobs:
           git checkout --orphan public-feed-publication
           git rm -rf . >/dev/null 2>&1 || true
 
-          cp /tmp/direct-bridge-feed.json ./direct-bridge-feed.json
+          cp -R /tmp/publication/. .
 
           cat > README.md <<'EOF'
           # Stoiximan Direct Bridge Public Feed
 
           Sanitized automated odds feed.
 
+          Files:
+
+          - `feed-index.json`: compact event index
+          - `events/<stoiximan_event_id>.json`: one file per event
+          - `direct-bridge-feed.json`: complete backup feed
+
           No credentials, cookies, tokens or personal data are stored here.
           EOF
 
-          git add README.md direct-bridge-feed.json
+          git add -A
           git commit -m "Update public Direct Bridge feed"
 
           git push --force origin HEAD:feed
